@@ -18,6 +18,7 @@ from ..renderers import GaussianRenderer
 from ..representations import Strivec, Gaussian, MeshExtractResult
 
 import kaolin.render.mesh as kres
+from bake_texture import bake_texture_and_return_mesh
 
 
 @torch.no_grad()
@@ -199,170 +200,6 @@ def _fill_holes(
     return verts, faces
 
 
-def postprocess_mesh(
-    vertices: np.array,
-    faces: np.array,
-    simplify: bool = True,
-    simplify_ratio: float = 0.9,
-    fill_holes: bool = True,
-    fill_holes_max_hole_size: float = 0.04,
-    fill_holes_max_hole_nbe: int = 32,
-    fill_holes_resolution: int = 1024,
-    fill_holes_num_views: int = 1000,
-    debug: bool = False,
-    verbose: bool = False,
-):
-    """
-    Postprocess a mesh by simplifying, removing invisible faces, and removing isolated pieces.
-
-    Args:
-        vertices (np.array): Vertices of the mesh. Shape (V, 3).
-        faces (np.array): Faces of the mesh. Shape (F, 3).
-        simplify (bool): Whether to simplify the mesh, using quadric edge collapse.
-        simplify_ratio (float): Ratio of faces to keep after simplification.
-        fill_holes (bool): Whether to fill holes in the mesh.
-        fill_holes_max_hole_size (float): Maximum area of a hole to fill.
-        fill_holes_max_hole_nbe (int): Maximum number of boundary edges of a hole to fill.
-        fill_holes_resolution (int): Resolution of the rasterization.
-        fill_holes_num_views (int): Number of views to rasterize the mesh.
-        verbose (bool): Whether to print progress.
-    """
-
-    if verbose:
-        tqdm.write(f'Before postprocess: {vertices.shape[0]} vertices, {faces.shape[0]} faces')
-
-    # Simplify
-    if simplify and simplify_ratio > 0:
-        mesh = pv.PolyData(vertices, np.concatenate([np.full((faces.shape[0], 1), 3), faces], axis=1))
-        mesh = mesh.decimate(simplify_ratio, progress_bar=verbose)
-        vertices, faces = mesh.points, mesh.faces.reshape(-1, 4)[:, 1:]
-        if verbose:
-            tqdm.write(f'After decimate: {vertices.shape[0]} vertices, {faces.shape[0]} faces')
-
-    # Remove invisible faces
-    if fill_holes:
-        vertices, faces = torch.tensor(vertices).cuda(), torch.tensor(faces.astype(np.int32)).cuda()
-        vertices, faces = _fill_holes(
-            vertices, faces,
-            max_hole_size=fill_holes_max_hole_size,
-            max_hole_nbe=fill_holes_max_hole_nbe,
-            resolution=fill_holes_resolution,
-            num_views=fill_holes_num_views,
-            debug=debug,
-            verbose=verbose,
-        )
-        vertices, faces = vertices.cpu().numpy(), faces.cpu().numpy()
-        if verbose:
-            tqdm.write(f'After remove invisible faces: {vertices.shape[0]} vertices, {faces.shape[0]} faces')
-
-    return vertices, faces
-
-
-def parametrize_mesh(vertices: np.array, faces: np.array):
-    """
-    Parametrize a mesh to a texture space, using xatlas.
-
-    Args:
-        vertices (np.array): Vertices of the mesh. Shape (V, 3).
-        faces (np.array): Faces of the mesh. Shape (F, 3).
-    """
-
-    vmapping, indices, uvs = xatlas.parametrize(vertices, faces)
-
-    vertices = vertices[vmapping]
-    faces = indices
-
-    return vertices, faces, uvs
-
-
-def bake_texture(
-    vertices: np.array,
-    faces: np.array,
-    uvs: np.array,
-    observations: List[np.array],
-    masks: List[np.array],
-    extrinsics: List[np.array],
-    intrinsics: List[np.array],
-    texture_size: int = 2048,
-    near: float = 0.1,
-    far: float = 10.0,
-    lambda_tv: float = 1e-2,
-    verbose: bool = False,
-):
-    """
-    Bake texture to a mesh from multiple observations.
-
-    Args:
-        vertices (np.array): Vertices of the mesh. Shape (V, 3).
-        faces (np.array): Faces of the mesh. Shape (F, 3).
-        uvs (np.array): UV coordinates of the mesh. Shape (V, 2).
-        observations (List[np.array]): List of observations. Each observation is a 2D image. Shape (H, W, 3).
-        masks (List[np.array]): List of masks. Each mask is a 2D image. Shape (H, W).
-        extrinsics (List[np.array]): List of extrinsics. Shape (4, 4).
-        intrinsics (List[np.array]): List of intrinsics. Shape (3, 3).
-        texture_size (int): Size of the texture.
-        near (float): Near plane of the camera.
-        far (float): Far plane of the camera.
-        mode (Literal['fast', 'opt']): Mode of texture baking.
-        lambda_tv (float): Weight of total variation loss in optimization.
-        verbose (bool): Whether to print progress.
-    """
-    vertices = torch.tensor(vertices).cuda()
-    faces = torch.tensor(faces.astype(np.int32)).cuda()
-    uvs = torch.tensor(uvs).cuda()
-    observations = [torch.tensor(obs / 255.0).float().cuda() for obs in observations]
-    masks = [torch.tensor(m>0).bool().cuda() for m in masks]
-    views = [utils3d.torch.extrinsics_to_view(torch.tensor(extr).cuda()) for extr in extrinsics]
-    projections = [utils3d.torch.intrinsics_to_perspective(torch.tensor(intr).cuda(), near, far) for intr in intrinsics]
-
-    rastctx = utils3d.torch.RastContext(backend='cuda')
-    observations = [observations.flip(0) for observations in observations]
-    masks = [m.flip(0) for m in masks]
-    _uv = []
-    _uv_dr = []
-    for observation, view, projection in tqdm(zip(observations, views, projections), total=len(views), disable=not verbose, desc='Texture baking (opt): UV'):
-        with torch.no_grad():
-            rast = utils3d.torch.rasterize_triangle_faces(
-                rastctx, vertices[None], faces, observation.shape[1], observation.shape[0], uv=uvs[None], view=view, projection=projection
-            )
-            _uv.append(rast['uv'].detach())
-            _uv_dr.append(rast['uv_dr'].detach())
-
-    texture = torch.nn.Parameter(torch.zeros((1, texture_size, texture_size, 3), dtype=torch.float32).cuda())
-    optimizer = torch.optim.Adam([texture], betas=(0.5, 0.9), lr=1e-2)
-
-    def cosine_anealing(optimizer, step, total_steps, start_lr, end_lr):
-        return end_lr + 0.5 * (start_lr - end_lr) * (1 + np.cos(np.pi * step / total_steps))
-    
-    def tv_loss(texture):
-        return torch.nn.functional.l1_loss(texture[:, :-1, :, :], texture[:, 1:, :, :]) + \
-                torch.nn.functional.l1_loss(texture[:, :, :-1, :], texture[:, :, 1:, :])
-
-    total_steps = 2500
-    with tqdm(total=total_steps, disable=not verbose, desc='Texture baking (opt): optimizing') as pbar:
-        for step in range(total_steps):
-            optimizer.zero_grad()
-            selected = np.random.randint(0, len(views))
-            uv, uv_dr, observation, mask = _uv[selected], _uv_dr[selected], observations[selected], masks[selected]
-            render = dr.texture(texture, uv, uv_dr)[0]
-            loss = torch.nn.functional.l1_loss(render[mask], observation[mask])
-            if lambda_tv > 0:
-                loss += lambda_tv * tv_loss(texture)
-            loss.backward()
-            optimizer.step()
-            # annealing
-            optimizer.param_groups[0]['lr'] = cosine_anealing(optimizer, step, total_steps, 1e-2, 1e-5)
-            pbar.set_postfix({'loss': loss.item()})
-            pbar.update()
-    texture = np.clip(texture[0].flip(0).detach().cpu().numpy() * 255, 0, 255).astype(np.uint8)
-    mask = 1 - utils3d.torch.rasterize_triangle_faces(
-        rastctx, (uvs * 2 - 1)[None], faces, texture_size, texture_size
-    )['mask'][0].detach().cpu().numpy().astype(np.uint8)
-    texture = cv2.inpaint(texture, mask, 3, cv2.INPAINT_TELEA)
-
-    return texture
-
-
 def to_glb(
     app_rep: Union[Strivec, Gaussian],
     mesh: MeshExtractResult,
@@ -380,54 +217,21 @@ def to_glb(
         app_rep (Union[Strivec, Gaussian]): Appearance representation.
         mesh (MeshExtractResult): Extracted mesh.
         simplify (float): Ratio of faces to remove in simplification.
-        fill_holes (bool): Whether to fill holes in the mesh.
-        fill_holes_max_size (float): Maximum area of a hole to fill.
         texture_size (int): Size of the texture.
         debug (bool): Whether to print debug information.
         verbose (bool): Whether to print progress.
     """
-    vertices = mesh.vertices.cpu().numpy()
-    faces = mesh.faces.cpu().numpy()
-    
-    # mesh postprocess
-    vertices, faces = postprocess_mesh(
-        vertices, faces,
-        simplify=simplify > 0,
-        simplify_ratio=simplify,
-        fill_holes=fill_holes,
-        fill_holes_max_hole_size=fill_holes_max_size,
-        fill_holes_max_hole_nbe=int(250 * np.sqrt(1-simplify)),
-        fill_holes_resolution=1024,
-        fill_holes_num_views=1000,
-        debug=debug,
-        verbose=verbose,
+    mesh = bake_texture_and_return_mesh(
+        app_rep,
+        mesh, 
+        simplify,
+        texture_size,
+        debug,
+        verbose
     )
 
-    # parametrize mesh
-    vertices, faces, uvs = parametrize_mesh(vertices, faces)
-
-    # bake texture
-    observations, extrinsics, intrinsics = render_multiview(app_rep, resolution=1024, nviews=100)
-    masks = [np.any(observation > 0, axis=-1) for observation in observations]
-    extrinsics = [extrinsics[i].cpu().numpy() for i in range(len(extrinsics))]
-    intrinsics = [intrinsics[i].cpu().numpy() for i in range(len(intrinsics))]
-    texture = bake_texture(
-        vertices, faces, uvs,
-        observations, masks, extrinsics, intrinsics,
-        texture_size=texture_size,
-        lambda_tv=0.01,
-        verbose=verbose
-    )
-    texture = Image.fromarray(texture)
-
-    # rotate mesh (from z-up to y-up)
-    vertices = vertices @ np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
-    material = trimesh.visual.material.PBRMaterial(
-        roughnessFactor=1.0,
-        baseColorTexture=texture,
-        baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8)
-    )
-    mesh = trimesh.Trimesh(vertices, faces, visual=trimesh.visual.TextureVisuals(uv=uvs, material=material))
     return mesh
+   
+
 
 

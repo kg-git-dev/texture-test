@@ -396,3 +396,9 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+
+# Temp folder
+tmp/
+
+# Debug folder
+bake_debug
