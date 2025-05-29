@@ -502,7 +502,7 @@ def bake_texture_and_return_mesh(
             "Check UV range and faces_uvs mapping."
         )
 
-    # ---------- normalise, export etc. ----------
+    # normalise, export etc
     tex = tex_acc / w_acc.clamp(min=1e-6)
     tex_np = (tex.clamp(0,1).cpu().numpy()*255).astype(np.uint8)
     Image.fromarray(tex_np).save(os.path.join(dbg,"baked_texture.png")) if debug else None
@@ -512,5 +512,6 @@ def bake_texture_and_return_mesh(
         image=Image.fromarray(tex_np),
         material=trimesh.visual.material.PBRMaterial(
             baseColorTexture=Image.fromarray(tex_np)))
-    up = np.array([[1,0,0],[0,0,-1],[0,1,0]],np.float32)
+    up = np.array([[1, 0, 0],[0, 0, 1],[0,-1, 0]], np.float32)
+
     return trimesh.Trimesh((Vn@up.T), Fn, visual=visual, process=False)
