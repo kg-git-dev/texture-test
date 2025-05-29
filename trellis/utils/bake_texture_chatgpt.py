@@ -36,6 +36,7 @@ from pytorch3d.transforms import Transform3d
 import cv2
 import matplotlib.pyplot as plt
 import os
+import csv
 
 
 def suppress_traceback(fn):
@@ -373,199 +374,144 @@ def postprocess_mesh(
     return vertices, faces
 
 
-
 def bake_texture_and_return_mesh(
     app_rep,
     mesh,
     simplify: float = 0.90,
     texture_size: int = 1024,
-    near: float = 0.1,
-    far: float = 10.0,
-    debug: bool = False,
+    near: float = 1,
+    far: float = 100.0,
+    debug: bool = True,
     verbose: bool = True,
 ):
     """
-    Bakes a texture onto `mesh` using multi-view renders of `app_rep`
-    (Gaussian | Strivec) and returns a trimesh.Trimesh with UV + PBR texture.
-    When `debug=True` diagnostic images/statistics are saved to ./debug_bake.
+    Same bake as before but with extra per-view diagnostics:
+      • pixel counts for rasteriser, mask, and their overlap
+      • vertices in camera space (min/max Z)
+      • first-view wireframe overlay
     """
-    # ------------ 0. prep I/O paths ------------
+
+    debug = True
+    device = "cuda"
+    
+    # ---------- 0. debug dirs ----------
     if debug:
-        dbg_dir = "debug_bake"
-        os.makedirs(dbg_dir, exist_ok=True)
-        print(f"[DBG] saving debug artefacts to {dbg_dir}/")
+        dbg = "debug_bake"
+        os.makedirs(dbg, exist_ok=True)
+        log_csv = open(os.path.join(dbg, "view_stats.csv"), "w", newline="")
+        log = csv.writer(log_csv)
+        log.writerow(["view", "rast_px", "mask_px", "ol_px",
+                      "minZ", "maxZ", "medianZ"])
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ------------ 1. mesh pre-processing ------------
-    V_np, F_np = mesh.vertices.cpu().numpy(), mesh.faces.cpu().numpy()
-    V_np, F_np = postprocess_mesh(V_np, F_np,
-                                  simplify=simplify > 0,
-                                  simplify_ratio=simplify,
-                                  verbose=verbose)
-    V_np, F_np, UV_np = parametrize_mesh(V_np, F_np)
+    # ---------- 1. mesh ----------
+    Vn, Fn = mesh.vertices.cpu().numpy(), mesh.faces.cpu().numpy()
+    Vn, Fn = postprocess_mesh(Vn, Fn, simplify_ratio=simplify)
+    Vn, Fn, UVn = parametrize_mesh(Vn, Fn)
 
-    # ------------ 2. render synthetic observations ------------
-    # (we keep PyTorch3D renders on GPU; move copies to CPU only for debug PNGs)
-    imgs, extrs, intrs = render_multiview(app_rep,
-                                          resolution=1024,
-                                          nviews=60)
+    V = torch.tensor(Vn,  dtype=torch.float32, device=dev)
+    F = torch.tensor(Fn,  dtype=torch.int64,   device=dev)
+    UV = torch.tensor(UVn, dtype=torch.float32, device=dev)
+    faces_uvs = F
+
+    # ---------- 2. observations ----------
+    imgs, extrs, intrs = render_multiview(app_rep, 1024, 60)
     H = W = imgs[0].shape[0]
-    masks_np = [np.any(rgb > 0, axis=-1) for rgb in imgs]
+    obs  = [torch.tensor(i/255.0, dtype=torch.float32, device=dev) for i in imgs]
+    msk  = [torch.tensor((i>0).any(-1), dtype=torch.bool, device=dev) for i in imgs]
 
-    # dump a few observations & masks
-    if debug:
-        for i in range(min(4, len(imgs))):
-            cv2.imwrite(f"{dbg_dir}/obs_{i}.png", cv2.cvtColor(imgs[i], cv2.COLOR_RGB2BGR))
-            cv2.imwrite(f"{dbg_dir}/mask_{i}.png", (masks_np[i] * 255).astype(np.uint8))
-
-    # ------------ 3. move everything to torch.float32 ------------
-    V     = torch.tensor(V_np,  dtype=torch.float32, device=device)
-    F     = torch.tensor(F_np,  dtype=torch.int64,   device=device)
-    UV    = torch.tensor(UV_np, dtype=torch.float32, device=device)
-    faces_uvs = F                      # xatlas guarantees 1-to-1 UVs
-
-    views = [extrinsics_to_view(torch.tensor(e, dtype=torch.float32,
-                                             device=device))
-             for e in (ex.cpu().numpy() for ex in extrs)]
-    projs = [intrinsics_to_perspective(torch.tensor(k, dtype=torch.float32,
-                                                    device=device), near, far)
-             for k in (in_.cpu().numpy() for in_ in intrs)]
-
-    obs_torch = [torch.tensor(img / 255.0, dtype=torch.float32, device=device)
-                 for img in imgs]
-    mask_bool = [torch.tensor(m, dtype=torch.bool, device=device) for m in masks_np]
-
-    # ------------ 4. build empty‐textured mesh ------------
-    tex_init = torch.zeros((1, texture_size, texture_size, 3),
-                           dtype=torch.float32, device=device)
+    # ---------- 3. empty-texture mesh ----------
+    tex0 = torch.zeros((1, texture_size, texture_size, 3),
+                       dtype=torch.float32, device=dev)
     mesh_p3d = Meshes(
         verts=[V], faces=[F],
-        textures=TexturesUV(
-            maps=tex_init.permute(0, 3, 1, 2),
-            faces_uvs=[faces_uvs], verts_uvs=[UV])
-    )
+        textures=TexturesUV(maps=tex0.permute(0,3,1,2),
+                            faces_uvs=[faces_uvs], verts_uvs=[UV]))
 
-    rasteriser = MeshRasterizer(
-        raster_settings=RasterizationSettings(
-            image_size=(H, W), faces_per_pixel=1, blur_radius=0.0)
-    )
+    rast = MeshRasterizer(
+        raster_settings=RasterizationSettings(image_size=(H,W),
+                                              faces_per_pixel=1))
 
-    # ------------ 5. accumulators ------------
-    tex_acc   = torch.zeros_like(tex_init[0])
-    w_acc     = torch.zeros(texture_size, texture_size, 1, device=device)
+    tex_acc = torch.zeros_like(tex0[0])
+    w_acc   = torch.zeros(texture_size, texture_size, 1, device=dev)
 
-    vis_total = 0  # for stats
+    views_ok = 0
+    for k,(rgb,mask,Ex,K3) in enumerate(tqdm(zip(obs,msk,extrs,intrs),
+                                             total=len(obs),
+                                             disable=not verbose)):
+        # ----- camera -----
+        view = extrinsics_to_view(Ex.to(dev).float())
+        R = Ex[:3, :3].to(device, dtype=torch.float32)
+        T = Ex[:3, 3].to(device, dtype=torch.float32)
+        K3 = K3.to(device, dtype=torch.float32)
+        fx, fy = K3[0, 0] * W, K3[1, 1] * H
+        cx, cy = K3[0, 2] * W, K3[1, 2] * H
+        cam = PerspectiveCameras(device=dev, in_ndc=False,
+                                 R=R[None], T=T[None],
+                                 focal_length=torch.tensor([[fx,fy]],dtype=torch.float32,device=dev),
+                                 principal_point=torch.tensor([[cx,cy]],dtype=torch.float32,device=dev),
+                                 image_size=torch.tensor([[H,W]],dtype=torch.int32,device=dev, near=near, far=far))
 
-    # ------------ 6. per-view bake ------------
-    for vi, (rgb, msk, view_m, K) in enumerate(tqdm(
-            list(zip(obs_torch, mask_bool, views, projs)),
-            desc="Baking", disable=not verbose)):
+        # ----- quick Z check -----
+        V_cam = (R @ V.T + T[:,None]).T       # (V,3)
+        Z = V_cam[:,2]
+        zmin,zmax,zmed = Z.min().item(), Z.max().item(), Z.median().item()
 
-        R, T = view_m[:3, :3], view_m[:3, 3]
-        fx, fy, cx, cy = (K[0, 0] * W, K[1, 1] * H,
-                          K[0, 2] * W, K[1, 2] * H)
-        cam = PerspectiveCameras(
-            device=device, in_ndc=False,
-            R=R[None], T=T[None],
-            focal_length=torch.tensor([[fx, fy]], dtype=torch.float32, device=device),
-            principal_point=torch.tensor([[cx, cy]], dtype=torch.float32, device=device),
-            image_size=torch.tensor([[H, W]], dtype=torch.int32, device=device),
+        # ----- rasterise -----
+        frags = rast(mesh_p3d, cameras=cam)
+        p2f   = frags.pix_to_face[0,...,0]
+        rast_vis = p2f >= 0
+        olap  = rast_vis & mask
+
+        if debug:
+            log.writerow([k, int(rast_vis.sum()), int(mask.sum()),
+                          int(olap.sum()), zmin, zmax, zmed])
+            if k==0:  # save first overlay even if empty
+                over = np.zeros((H,W,3),np.uint8)
+                over[...,2] = rast_vis.cpu().numpy()*255
+                over[...,1] = mask.cpu().numpy()*255
+                cv2.imwrite(f"{dbg}/overlay_{k}.png", over)
+
+        if olap.sum()==0:
+            continue  # skip this view but keep logging
+
+        views_ok += 1
+        fi = p2f[olap]; bary = frags.bary_coords[0,...,0,:][olap]
+        uv = (bary[...,None]*UV[faces_uvs[fi]]).sum(-2)
+        uv[...,1] = 1-uv[...,1]
+        xy = (uv*(texture_size-1)).long()
+        u,v = xy[:,0],xy[:,1]
+        tex_acc.index_put_((v,u), rgb[olap], accumulate=True)
+        w_acc .index_put_((v,u),
+                          torch.ones_like(v,dtype=torch.float32)[:,None],
+                          accumulate=True)
+
+    if debug: log_csv.close()
+
+    if views_ok==0:
+        raise RuntimeError(
+            "All views had zero overlap. "
+            "Inspect debug_bake/overlay_0.png and view_stats.csv:\n"
+            "  • If blue channel is empty → camera/extrinsics wrong.\n"
+            "  • If green channel is empty → mask is empty or threshold too high."
         )
 
-        frags = rasteriser(mesh_p3d, cameras=cam)
-        pix2f = frags.pix_to_face[0, ..., 0]
-        bari  = frags.bary_coords[0, ..., 0, :]
-        vis_mask = (pix2f >= 0) & msk      # combine rasteriser & user mask
-
-        if debug and vi < 4:
-            # cyan = rasteriser, red = user mask
-            vis_png = np.zeros((H, W, 3), np.uint8)
-            vis_png[..., 2] = vis_mask.cpu().numpy() * 255  # blue
-            vis_png[..., 1] = msk.cpu().numpy() * 255       # green
-            cv2.imwrite(f"{dbg_dir}/visible_{vi}.png", vis_png)
-
-        if vis_mask.sum() == 0:
-            continue
-
-        vis_total += int(vis_mask.sum())
-
-        fi = pix2f[vis_mask]
-        bari_vis = bari[vis_mask]
-        uv_tri   = UV[faces_uvs[fi]]
-        uv_vis   = (bari_vis[..., None] * uv_tri).sum(-2)
-        uv_vis[..., 1] = 1.0 - uv_vis[..., 1]
-
-        tex_xy = (uv_vis * (texture_size - 1)).long()
-        u, v   = tex_xy[:, 0], tex_xy[:, 1]
-        clr    = rgb[vis_mask]
-
-        tex_acc.index_put_((v, u), clr, accumulate=True)
-        w_acc.index_put_((v, u),
-                         torch.ones_like(v, dtype=torch.float32).unsqueeze(-1),
-                         accumulate=True)
-
-    # ------------ 7. final texture ------------
-    covered = (w_acc > 0).sum().item()
-    print(f"[INFO] Texels hit by at least one view: {covered}"
-          f" / {texture_size*texture_size} ({covered/texture_size**2:.1%})")
-    if vis_total == 0:
-        raise RuntimeError("No pixel was ever considered visible; "
-                           "check masks & camera matrices!")
-
-    tex_final = tex_acc / w_acc.clamp(min=1e-6)
-    if debug:
-        # heat-map of coverage
-        heat = (w_acc.squeeze() / w_acc.max()).cpu().numpy()
-        heat = (plt_cm := cv2.applyColorMap((heat * 255).astype(np.uint8),
-                                            cv2.COLORMAP_VIRIDIS))
-        cv2.imwrite(f"{dbg_dir}/uv_scatter.png", heat)
-        cv2.imwrite(f"{dbg_dir}/baked_texture.png",
-                    cv2.cvtColor((tex_final.cpu().numpy()*255).astype(np.uint8),
-                                 cv2.COLOR_RGB2BGR))
-
-    # ------------ 8. debug render of baked mesh ------------
-    if debug:
-        # from pytorch3d.renderer import (
-        #     RasterizationSettings, MeshRenderer, HardPhongShader,
-        #     PointLights, BlendParams)
-        R0, T0 = look_at_view_transform(dist=2.0, elev=0, azim=0, device=device)
-        cam0 = PerspectiveCameras(device=device, R=R0, T=T0,
-                                  fov=40.0, in_ndc=True)
-        mesh_p3d.textures = TexturesUV(
-            maps=tex_final.permute(2, 0, 1)[None],
-            faces_uvs=[faces_uvs], verts_uvs=[UV])
-
-        renderer_dbg = MeshRenderer(
-            rasterizer=MeshRasterizer(
-                cameras=cam0,
-                raster_settings=RasterizationSettings(image_size=H)),
-            shader=HardPhongShader(
-                device=device, cameras=cam0,
-                lights=PointLights(device=device, location=[[0, 2, 2]]),
-                blend_params=BlendParams(background_color=(0, 0, 0)))
+    if (w_acc>0).sum()==0:
+        raise RuntimeError(
+            "Rasteriser saw faces but all UVs mapped outside [0,1]. "
+            "Check UV range and faces_uvs mapping."
         )
-        dbg_img = renderer_dbg(mesh_p3d)[0, ..., :3].cpu().numpy()
-        cv2.imwrite(f"{dbg_dir}/render_debug.png",
-                    cv2.cvtColor((dbg_img * 255).astype(np.uint8),
-                                 cv2.COLOR_RGB2BGR))
 
-    # ------------ 9. export to trimesh ------------
-    tex_np = (tex_final.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
-    tex_img = Image.fromarray(tex_np)
-    R_zup_to_yup = np.array([[1, 0, 0],
-                             [0, 0,-1],
-                             [0, 1, 0]], np.float32)
-    verts_np = (V.cpu().numpy() @ R_zup_to_yup.T)
+    # ---------- normalise, export etc. ----------
+    tex = tex_acc / w_acc.clamp(min=1e-6)
+    tex_np = (tex.clamp(0,1).cpu().numpy()*255).astype(np.uint8)
+    Image.fromarray(tex_np).save(os.path.join(dbg,"baked_texture.png")) if debug else None
+
     visual = trimesh.visual.TextureVisuals(
         uv=UV.cpu().numpy(),
-        image=tex_img,
+        image=Image.fromarray(tex_np),
         material=trimesh.visual.material.PBRMaterial(
-            baseColorTexture=tex_img, roughnessFactor=1.0))
-    tri_mesh = trimesh.Trimesh(verts_np, F_np, visual=visual, process=False)
-
-    print("[DONE] Bake complete.")
-    return tri_mesh
-
-
-
+            baseColorTexture=Image.fromarray(tex_np)))
+    up = np.array([[1,0,0],[0,0,-1],[0,1,0]],np.float32)
+    return trimesh.Trimesh((Vn@up.T), Fn, visual=visual, process=False)

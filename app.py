@@ -200,6 +200,7 @@ def extract_glb(
     glb_path = os.path.join(user_dir, 'sample.glb')
     glb.export(glb_path)
     torch.cuda.empty_cache()
+    print("GLB extraction completed")
     return glb_path, glb_path
 
 
